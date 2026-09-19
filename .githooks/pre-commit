@@ -1,0 +1,162 @@
+#!/usr/bin/env node
+// git pre-commit フック。コミットが履歴に入る「前」に止める最後の関門。
+//
+// なぜローカルに必要か:
+//   GitHub Actionsは push した後にしか動かない。無料プランのPrivateリポジトリでは
+//   GitHub純正のsecret scanning push保護もブランチ保護も使えないため、
+//   実際に事故を止められるのはこの位置だけになる。
+//
+// 実際に起きた事故(2026-08-01):
+//   Playwright MCPが生成した Meta Business Suite のログイン済み画面ダンプ395ファイルが
+//   auto-commit.js の `git add -A` に拾われ、未pushコミットに紛れ込んでいた。
+//   push直前に人が偶然気づいて回避しただけで、仕組みでは止まらなかった。
+//
+// 有効化: git config core.hooksPath .githooks
+//   (.git/hooks はバージョン管理されず共有できないため、この方式を使う)
+//
+// 緊急時の迂回: git commit --no-verify
+//   ただし迂回した事実は残らないため、常用しないこと。
+
+const { execSync } = require("child_process");
+const path = require("path");
+
+let changeType;
+try {
+  changeType = require(path.resolve(__dirname, "../.claude/hooks/lib/change-type.js"));
+} catch {
+  changeType = null; // モジュールが無くても他のチェックは動かす
+}
+
+const MAX_NEW_FILES = 50;
+const MAX_FILE_BYTES = 1024 * 1024; // 1MB
+
+const problems = [];
+
+function sh(cmd) {
+  return execSync(cmd, { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
+}
+
+// ステージされているファイル一覧(状態コード付き)
+let staged = [];
+try {
+  // core.quotepath=false: 既定のままだと日本語等の非ASCIIパスが8進エスケープの
+  // 引用符付き文字列で返り、以降のファイル名判定(秘匿情報ファイル名・拡張子・
+  // 種別B判定)が正しいパスと一致しなくなる(2026-09-19、pre-push新設時に発覚)。
+  staged = sh("git -c core.quotepath=false diff --cached --name-status --diff-filter=ACMR")
+    .split("\n")
+    .map((l) => l.replace(/\r$/, ""))
+    .filter(Boolean)
+    .map((line) => {
+      const parts = line.split("\t");
+      return { status: parts[0], file: parts[parts.length - 1].replace(/^"|"$/g, "") };
+    });
+} catch {
+  process.exit(0); // 初回コミット等で失敗する場合は素通しする
+}
+
+if (staged.length === 0) process.exit(0);
+
+// ───────── 1. 秘匿情報の混入 ─────────
+const SECRET_PATTERNS = [
+  { re: /EAA[A-Za-z0-9]{30,}/, label: "Meta/Facebook アクセストークン" },
+  { re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/, label: "秘密鍵" },
+  { re: /\bAKIA[0-9A-Z]{16}\b/, label: "AWS アクセスキーID" },
+  { re: /\bgh[pousr]_[A-Za-z0-9]{36,}/, label: "GitHub トークン" },
+  { re: /\bsk-[A-Za-z0-9]{32,}/, label: "APIキー(sk- 形式)" },
+  { re: /\bxox[baprs]-[A-Za-z0-9-]{10,}/, label: "Slack トークン" },
+];
+
+const SECRET_FILENAMES = /(^|\/)(\.env(\..+)?|.*\.(key|pem|p12|pfx)|credentials(\..+)?)$/i;
+
+for (const { file } of staged) {
+  if (SECRET_FILENAMES.test(file) && !/\.example$/i.test(file)) {
+    problems.push(`秘匿情報ファイルがステージされています: ${file}`);
+  }
+}
+
+let addedContent = "";
+try {
+  addedContent = sh("git -c core.quotepath=false diff --cached --unified=0");
+} catch {
+  /* 差分が取れない場合はスキップ */
+}
+for (const { re, label } of SECRET_PATTERNS) {
+  const m = addedContent.match(new RegExp(`^\\+.*${re.source}`, "m"));
+  if (m) {
+    problems.push(`${label} らしき文字列がコミット内容に含まれています(値は表示しません)`);
+  }
+}
+
+// ───────── 1b. 「社内限定」等の内部限定マーカーの混入 ─────────
+// 判定ロジックは .claude/hooks/lib/internal-marker-guard.js に集約
+// (.githooks/pre-push とここで定義がズレないようにするため、2026-09-19)。
+let internalMarkerGuard;
+try {
+  internalMarkerGuard = require(path.resolve(__dirname, "../.claude/hooks/lib/internal-marker-guard.js"));
+} catch {
+  internalMarkerGuard = null;
+}
+
+if (internalMarkerGuard && internalMarkerGuard.hasNewInternalOnlyMarker(addedContent)) {
+  problems.push(
+    `「社内限定」等の内部限定マーカーを含む行が追加されています(該当行は表示しません)。\n` +
+      `      本当にこのリポジトリにコミットしてよいファイルか確認してください` +
+      `(過去に価格根拠.mdがこの経路でorigin/mainへ流出した事故があります。詳細はdocs/knowledge/QA/秘密情報.md参照)。`
+  );
+}
+
+// ───────── 2. 大量・巨大ファイル(2026-08-01の事故のシグネチャ) ─────────
+const added = staged.filter((s) => s.status.startsWith("A"));
+if (added.length > MAX_NEW_FILES) {
+  problems.push(
+    `1コミットで ${added.length} 件の新規ファイルを追加しようとしています(上限 ${MAX_NEW_FILES})。\n` +
+      `      ツールの生成物が紛れ込んでいないか確認してください。例: ${added
+        .slice(0, 3)
+        .map((s) => s.file)
+        .join(", ")} …`
+  );
+}
+
+for (const { file } of staged) {
+  let size = 0;
+  try {
+    size = Number(sh(`git cat-file -s :"${file}"`).trim());
+  } catch {
+    continue;
+  }
+  if (size > MAX_FILE_BYTES) {
+    problems.push(`1MBを超えるファイル: ${file} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+  }
+}
+
+// ───────── 3. main上での種別B変更 ─────────
+if (changeType) {
+  let branch = "";
+  try {
+    branch = sh("git rev-parse --abbrev-ref HEAD").trim();
+  } catch {
+    /* 判定できない場合はスキップ */
+  }
+
+  if (changeType.isProtectedBranch(branch)) {
+    const typeB = changeType.findTypeB(staged.map((s) => s.file));
+    if (typeB.length > 0) {
+      problems.push(
+        `main上で「種別B」(組織の仕組みを変えるファイル)をコミットしようとしています:\n` +
+          typeB.map((r) => `      - ${r.path} (${r.label})`).join("\n") +
+          `\n      作業ブランチを切ってPRを通してください: git switch -c chore/<変更内容>`
+      );
+    }
+  }
+}
+
+// ───────── 判定 ─────────
+if (problems.length > 0) {
+  console.error("\n[pre-commit] コミットを中止しました:\n");
+  problems.forEach((p, i) => console.error(`  ${i + 1}. ${p}\n`));
+  console.error("  内容を確認し、不要なファイルは `git restore --staged <file>` で外してください。");
+  console.error("  誤検知が明らかな場合のみ `git commit --no-verify` で迂回できます。\n");
+  process.exit(1);
+}
+
+process.exit(0);

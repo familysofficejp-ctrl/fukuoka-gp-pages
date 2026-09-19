@@ -1,0 +1,161 @@
+#!/usr/bin/env node
+// git pre-push フック。ローカルの`git push`実行前の最後の関門。
+//
+// なぜ必要か(2026-09-19、Opus監査で発覚):
+//   .githooks/pre-commit は「コミット時」の関門だが、rebase・cherry-pick後の
+//   コミットや GitHub の squash merge はこれを経由しない。実際に、本社
+//   projects/配下へ1MB上限を超える動画2本(8.8MB/2.6MB)が author date と
+//   committer date の異なるコミット(rebase/squash由来と推測される)で混入し、
+//   origin/main まで届いていた事故が発覚した。push直前の最終防衛ラインとして
+//   このフックを追加する。
+//
+// GitHub側の「squash merge」ボタン自体はこのマシンを経由しないため、
+// このフックでも防げない(サーバー側でマージコミットが作られるため)。
+// そちらはCI(.github/workflows/checks.yml)のgitleaks等、push後の検知に委ねる。
+// このフックが埋めるのは「ローカルから直接pushする経路」の穴。
+//
+// 有効化: .githooks/pre-commit と同じ `git config core.hooksPath .githooks`
+//   で自動的に有効になる(追加設定は不要)。
+//
+// 緊急時の迂回: git push --no-verify
+//   ただし迂回した事実は残らないため、常用しないこと。
+
+const { execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+let projectCodeGuard;
+try {
+  projectCodeGuard = require(path.resolve(__dirname, "../.claude/hooks/lib/project-code-guard.js"));
+} catch {
+  projectCodeGuard = null;
+}
+
+let internalMarkerGuard;
+try {
+  internalMarkerGuard = require(path.resolve(__dirname, "../.claude/hooks/lib/internal-marker-guard.js"));
+} catch {
+  internalMarkerGuard = null;
+}
+
+const MAX_FILE_BYTES = 1024 * 1024; // 1MB、pre-commitと同じ基準
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"; // gitの空ツリーの固定ハッシュ
+const ZERO_SHA = "0000000000000000000000000000000000000000";
+
+function sh(cmd) {
+  return execSync(cmd, { encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
+}
+
+let input = "";
+try {
+  input = fs.readFileSync(0, "utf8");
+} catch {
+  process.exit(0); // stdinが読めない場合は素通しする
+}
+
+const refLines = input
+  .split("\n")
+  .map((l) => l.trim())
+  .filter(Boolean);
+
+if (refLines.length === 0) process.exit(0);
+
+const problems = [];
+
+for (const line of refLines) {
+  const [localRef, localSha, , remoteSha] = line.split(/\s+/);
+  if (!localSha || localSha === ZERO_SHA) continue; // ブランチ削除はスキップ
+
+  // 新規ブランチのpush(remoteShaが無い)は、EMPTY_TREEを基点にすると
+  // main由来の既存履歴全体を「新規追加」と誤判定してしまう(2026-09-19、
+  // このフック自身の初回pushで実際に発生し発覚)。originのデフォルト
+  // ブランチとのmerge-baseを基点にすることで、そのブランチが実際に
+  // 追加した差分だけを見るようにする。取得できない場合(最初の空リポジトリ等)
+  // のみEMPTY_TREEにフォールバックする。
+  let base = remoteSha && remoteSha !== ZERO_SHA ? remoteSha : null;
+  if (!base) {
+    for (const candidate of ["origin/main", "origin/master"]) {
+      try {
+        base = sh(`git merge-base "${localSha}" "${candidate}"`).trim();
+        if (base) break;
+      } catch {
+        /* 候補が無ければ次を試す */
+      }
+    }
+  }
+  if (!base) base = EMPTY_TREE;
+
+  let changed = [];
+  try {
+    // core.quotepath=false: 既定のままだと日本語等の非ASCIIパスが8進エスケープの
+    // 引用符付き文字列で返り、後段のcat-file/拡張子判定が空振りする
+    // (2026-09-19、実際に価格根拠流出コミットを模擬テストして発覚)。
+    changed = sh(`git -c core.quotepath=false diff --name-status --diff-filter=ACMR "${base}" "${localSha}"`)
+      .split("\n")
+      .map((l) => l.replace(/\r$/, ""))
+      .filter(Boolean)
+      .map((l) => {
+        const parts = l.split("\t");
+        return { file: parts[parts.length - 1].replace(/^"|"$/g, "") };
+      });
+  } catch {
+    continue; // 差分が取れない場合はスキップ(新規空リポジトリ等)
+  }
+
+  if (changed.length === 0) continue;
+
+  // 1MB超のファイル(このpushで新規に追加・変更されたものだけを見る。
+  // 既にremote側にある大きいファイルを繰り返し検知しないため)
+  for (const { file } of changed) {
+    let size = 0;
+    try {
+      size = Number(sh(`git cat-file -s "${localSha}:${file}"`).trim());
+    } catch {
+      continue;
+    }
+    if (size > MAX_FILE_BYTES) {
+      problems.push(
+        `[${localRef}] 1MBを超えるファイルがpushされようとしています: ${file} (${(size / 1024 / 1024).toFixed(1)}MB)`
+      );
+    }
+  }
+
+  // projects/配下への実装コード・メディアファイルの混入
+  if (projectCodeGuard) {
+    for (const { file } of changed) {
+      const { blocked, ext } = projectCodeGuard.checkProjectCode(file);
+      if (blocked) {
+        problems.push(
+          `[${localRef}] projects/配下に実装ファイル(.${ext})がpushされようとしています: ${file}`
+        );
+      }
+    }
+  }
+
+  // 「社内限定」等の内部限定マーカー(このpushで追加された行のみ)
+  if (internalMarkerGuard) {
+    let addedContent = "";
+    try {
+      addedContent = sh(`git -c core.quotepath=false diff --unified=0 "${base}" "${localSha}"`);
+    } catch {
+      addedContent = "";
+    }
+    if (internalMarkerGuard.hasNewInternalOnlyMarker(addedContent)) {
+      problems.push(
+        `[${localRef}] 「社内限定」等の内部限定マーカーを含む行がpushされようとしています(該当行は表示しません)。`
+      );
+    }
+  }
+}
+
+if (problems.length > 0) {
+  console.error("\n[pre-push] pushを中止しました:\n");
+  problems.forEach((p, i) => console.error(`  ${i + 1}. ${p}\n`));
+  console.error(
+    "  rebase・squash等でpre-commitを経由しなかった変更が含まれている可能性があります。内容を確認してください。"
+  );
+  console.error("  誤検知が明らかな場合のみ `git push --no-verify` で迂回できます。\n");
+  process.exit(1);
+}
+
+process.exit(0);
